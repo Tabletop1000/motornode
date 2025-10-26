@@ -17,6 +17,7 @@
 #include "bdc_motor.h"
 #include "pid_ctrl.h"
 #include "string.h"
+#include "math.h"
 
 static const char *TAG = "motornode";
 
@@ -36,6 +37,8 @@ static const int RX_BUF_SIZE = 1024;
 
 #define BDC_ENCODER_GPIO_A            18
 #define BDC_ENCODER_GPIO_B            19
+#define BDC_ENCODER_PPR               5281.1
+#define TICKS_TO_AVEL                 (BDC_ENCODER_PPR/(2*3.1415926536))
 #define BDC_ENCODER_PCNT_HIGH_LIMIT   500
 #define BDC_ENCODER_PCNT_LOW_LIMIT    -500
 
@@ -44,8 +47,8 @@ static const int RX_BUF_SIZE = 1024;
 
 #define TXD_PIN 1
 #define RXD_PIN 3
-
-int BDC_PID_EXPECT_SPEED = 0;
+static const float pi = 3.1415926536;
+static int BDC_PID_EXPECT_SPEED = 0;
 
 typedef struct {
     bdc_motor_handle_t motor;
@@ -53,6 +56,13 @@ typedef struct {
     pid_ctrl_block_handle_t pid_ctrl;
     int report_pulses;
 } motor_control_context_t;
+
+
+void ticks_to_angular_vel(int32_t ticks, float *angular_vel)
+{
+    *angular_vel = (ticks/0.01)*((2*pi)/(BDC_ENCODER_PPR));
+}
+
 
 static void pid_loop_cb(void *args)
 {
@@ -68,14 +78,32 @@ static void pid_loop_cb(void *args)
     int real_pulses = cur_pulse_count - last_pulse_count;
     last_pulse_count = cur_pulse_count;
     ctx->report_pulses = real_pulses;
+    float measured_speed = 0;
+    ticks_to_angular_vel(real_pulses, &measured_speed);
 
     // calculate the speed error
-    float error = BDC_PID_EXPECT_SPEED - real_pulses;
+    float error = BDC_PID_EXPECT_SPEED - measured_speed;
     float new_speed = 0;
 
     // set the new speed
     pid_compute(pid_ctrl, error, &new_speed);
-    bdc_motor_set_speed(motor, (uint32_t)new_speed);
+    int offset = 0;
+    if(new_speed < -0.01) {
+        offset = 60;
+        bdc_motor_forward(motor);
+    }
+    else if (new_speed > 0.01){
+        offset = 60;
+        bdc_motor_reverse(motor);
+    } else {
+        offset = 0;
+    }
+
+    uint32_t new_speed_uint = (uint32_t)(fabs(new_speed*5 + offset));
+    if (new_speed_uint >= BDC_MCPWM_DUTY_TICK_MAX)
+        new_speed_uint = BDC_MCPWM_DUTY_TICK_MAX-1;
+    printf("%.2d,%.2f,%.2f\n", BDC_PID_EXPECT_SPEED,measured_speed, new_speed );
+    bdc_motor_set_speed(motor, new_speed_uint);
 }
 
 void init_uart(void)
@@ -102,8 +130,8 @@ static void rx_task(void *arg)
         const int rxBytes = uart_read_bytes(UART_NUM_0, data, RX_BUF_SIZE, 100 / portTICK_PERIOD_MS);
         if (rxBytes > 0) {
             data[rxBytes] = 0;
+
             BDC_PID_EXPECT_SPEED = atoi(data);
-            ESP_LOGI(RX_TASK_TAG, "%d", BDC_PID_EXPECT_SPEED);
         }
     }
     free(data);
@@ -182,12 +210,12 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Create PID control block");
     pid_ctrl_parameter_t pid_runtime_param = {
-        .kp = 0.6,
+        .kp = 0.8,
         .ki = 0.4,
         .kd = 0.2,
         .cal_type = PID_CAL_TYPE_INCREMENTAL,
         .max_output   = BDC_MCPWM_DUTY_TICK_MAX - 1,
-        .min_output   = 0,
+        .min_output   = (-1) * (BDC_MCPWM_DUTY_TICK_MAX + 1),
         .max_integral = 1000,
         .min_integral = -1000,
     };
