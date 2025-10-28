@@ -54,7 +54,7 @@ static const int RX_BUF_SIZE = 1024;
 #define TXD_PIN 1
 #define RXD_PIN 3
 static const float pi = 3.1415926536;
-static int Speed1_Command = 0;
+static float Speed1_Command = 0.0;
 static float Speed2_Command = 0.0;
 
 typedef struct {
@@ -147,10 +147,9 @@ static void pid2_loop_cb(void *args)
         offset = 0;
     }
 
-    uint32_t new_speed_uint = (uint32_t)(fabs(new_speed*5 + offset));
+    uint32_t new_speed_uint = (uint32_t)(fabs(new_speed*2 + offset));
     if (new_speed_uint >= BDC_MCPWM_DUTY_TICK_MAX)
         new_speed_uint = BDC_MCPWM_DUTY_TICK_MAX-1;
-    printf("%.2f,%.2f,%.2f\n", Speed2_Command,measured_speed, new_speed );
     bdc_motor_set_speed(motor, new_speed_uint);
 }
 
@@ -175,12 +174,10 @@ static void rx_task(void *arg)
     esp_log_level_set(RX_TASK_TAG, ESP_LOG_INFO);
     char* data = (char*) malloc(RX_BUF_SIZE + 1);
     while(1) {
-        const int rxBytes = uart_read_bytes(UART_NUM_0, data, RX_BUF_SIZE, 100 / portTICK_PERIOD_MS);
-        if (rxBytes > 0) {
+        const int rxBytes = uart_read_bytes(UART_NUM_0, data, RX_BUF_SIZE, 10 / portTICK_PERIOD_MS);
+        if (rxBytes > 5) {
             data[rxBytes] = 0;
-
-            Speed1_Command = atoi(data);
-            Speed2_Command = atof(data);
+            sscanf(data,"%f:%f",&Speed1_Command, &Speed2_Command);
         }
     }
     free(data);
@@ -369,10 +366,13 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_timer_start_periodic(pid_loop_timer1, BDC_PID_LOOP_PERIOD_MS * 1000));
     ESP_ERROR_CHECK(esp_timer_start_periodic(pid_loop_timer2, BDC_PID_LOOP_PERIOD_MS * 1000));
     init_uart();
-    xTaskCreate(rx_task, "uart_rx_task", 2048, NULL, configMAX_PRIORITIES - 1, NULL);
+    xTaskCreate(rx_task, "uart_rx_task", 2048*2, NULL, configMAX_PRIORITIES - 1, NULL);
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(100));
+        
+        printf("%f:%f\n",Speed1_Command,Speed2_Command);
+            
         // the following logging format is according to the requirement of serial-studio frame format
         // also see the dashboard config file `serial-studio-dashboard.json` for more information
 #if SERIAL_STUDIO_DEBUG
