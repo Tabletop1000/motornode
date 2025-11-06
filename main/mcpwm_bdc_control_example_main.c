@@ -369,9 +369,11 @@ void app_main(void)
     xTaskCreate(rx_task, "uart_rx_task", 2048*2, NULL, configMAX_PRIORITIES - 1, NULL);
 
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-        
-        printf("%f:%f\n",Speed1_Command,Speed2_Command);
+        vTaskDelay(pdMS_TO_TICKS(50));
+        float m1_vel, m2_vel;
+        ticks_to_angular_vel(motor1_ctrl_ctx.report_pulses, &m1_vel);
+        ticks_to_angular_vel(motor2_ctrl_ctx.report_pulses, &m2_vel);
+        printf("%f:%f\n",m1_vel ,m2_vel);
             
         // the following logging format is according to the requirement of serial-studio frame format
         // also see the dashboard config file `serial-studio-dashboard.json` for more information
