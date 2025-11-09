@@ -45,8 +45,8 @@ static const int RX_BUF_SIZE = 1024;
 #define BDC2_ENCODER_GPIO_B            5
 #define BDC1_ENCODER_PPR               5281.1
 #define BDC2_ENCODER_PPR               1425.1
-#define BDC_ENCODER_PCNT_HIGH_LIMIT    500
-#define BDC_ENCODER_PCNT_LOW_LIMIT    -500
+#define BDC_ENCODER_PCNT_HIGH_LIMIT    5000
+#define BDC_ENCODER_PCNT_LOW_LIMIT    -5000
 
 #define BDC_PID_LOOP_PERIOD_MS        10   // calculate the motor speed every 10ms
 //#define Speed1_Command          5  // expected motor speed, in the pulses counted by the rotary encoder
@@ -61,13 +61,35 @@ typedef struct {
     bdc_motor_handle_t motor;
     pcnt_unit_handle_t pcnt_encoder;
     pid_ctrl_block_handle_t pid_ctrl;
+    float encoder_ppr;
+    int report_pulses_diff;
     int report_pulses;
 } motor_control_context_t;
 
 
-void ticks_to_angular_vel(int32_t ticks, float *angular_vel)
+float ticks_to_angular_vel(int32_t ticks, float encoder_ppr, float dt)
 {
-    *angular_vel = (ticks/0.01)*((2*pi)/(BDC1_ENCODER_PPR));
+    float angular_vel = 0.0;
+    if(encoder_ppr > 0) {
+        angular_vel = (ticks/dt)*((2*pi)/(encoder_ppr));
+    }
+    return angular_vel;
+}
+
+float ticks_to_angle(int32_t ticks, float encoder_ppr)
+{
+    float angle = 0.0;
+    if(encoder_ppr > 0) {
+        angle = (ticks)*((2*pi)/(encoder_ppr));
+    }
+    return angle;
+}
+
+float get_current_angle(motor_control_context_t *motor_ctx)
+{
+    int cur_pulse_count = 0;
+    pcnt_unit_get_count(motor_ctx->pcnt_encoder, &cur_pulse_count);
+    return ticks_to_angle(cur_pulse_count, motor_ctx->encoder_ppr);
 }
 
 
@@ -78,15 +100,16 @@ static void pid_loop_cb(void *args)
     pcnt_unit_handle_t pcnt_unit = ctx->pcnt_encoder;
     pid_ctrl_block_handle_t pid_ctrl = ctx->pid_ctrl;
     bdc_motor_handle_t motor = ctx->motor;
+    float ppr = ctx->encoder_ppr;
 
     // get the result from rotary encoder
     int cur_pulse_count = 0;
     pcnt_unit_get_count(pcnt_unit, &cur_pulse_count);
     int real_pulses = cur_pulse_count - last_pulse_count;
     last_pulse_count = cur_pulse_count;
-    ctx->report_pulses = real_pulses;
-    float measured_speed = 0;
-    ticks_to_angular_vel(real_pulses, &measured_speed);
+    ctx->report_pulses_diff = real_pulses;
+    float measured_speed = ticks_to_angular_vel(real_pulses, ppr, 0.01);
+    
 
     // calculate the speed error
     float error = Speed1_Command - measured_speed;
@@ -125,9 +148,9 @@ static void pid2_loop_cb(void *args)
     pcnt_unit_get_count(pcnt_unit, &cur_pulse_count);
     int real_pulses = cur_pulse_count - last_pulse_count;
     last_pulse_count = cur_pulse_count;
-    ctx->report_pulses = real_pulses;
-    float measured_speed = 0;
-    ticks_to_angular_vel(real_pulses, &measured_speed);
+    ctx->report_pulses_diff = real_pulses;
+    float ppr = ctx->encoder_ppr;
+    float measured_speed = ticks_to_angular_vel(real_pulses, ppr, 0.01);
 
     // calculate the speed error
     float error = Speed2_Command - measured_speed;
@@ -209,10 +232,12 @@ void app_main(void)
 
     static motor_control_context_t motor1_ctrl_ctx = {
         .pcnt_encoder = NULL,
+        .encoder_ppr = BDC1_ENCODER_PPR,
     };
 
     static motor_control_context_t motor2_ctrl_ctx = {
         .pcnt_encoder = NULL,
+        .encoder_ppr = BDC2_ENCODER_PPR,
     };
 
     ESP_LOGI(TAG, "Create DC motors");
@@ -370,15 +395,16 @@ void app_main(void)
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(50));
-        float m1_vel, m2_vel;
-        ticks_to_angular_vel(motor1_ctrl_ctx.report_pulses, &m1_vel);
-        ticks_to_angular_vel(motor2_ctrl_ctx.report_pulses, &m2_vel);
-        printf("%f:%f\n",m1_vel ,m2_vel);
-            
+        printf("%f:%f:%f:%f\n",
+            ticks_to_angular_vel(motor1_ctrl_ctx.report_pulses_diff, BDC1_ENCODER_PPR, 0.01),
+            ticks_to_angular_vel(motor2_ctrl_ctx.report_pulses_diff, BDC2_ENCODER_PPR, 0.01),
+            get_current_angle(&motor1_ctrl_ctx),
+            get_current_angle(&motor2_ctrl_ctx));
+
         // the following logging format is according to the requirement of serial-studio frame format
         // also see the dashboard config file `serial-studio-dashboard.json` for more information
 #if SERIAL_STUDIO_DEBUG
-        //printf("/*%d*/\r\n", motor1_ctrl_ctx.report_pulses);
+        //printf("/*%d*/\r\n", motor1_ctrl_ctx.report_pulses_diff);
 #endif
     }
 }
