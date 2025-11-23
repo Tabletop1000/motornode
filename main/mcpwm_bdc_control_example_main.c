@@ -43,13 +43,12 @@ static const int RX_BUF_SIZE = 1024;
 #define BDC1_ENCODER_GPIO_B            19
 #define BDC2_ENCODER_GPIO_A            4
 #define BDC2_ENCODER_GPIO_B            5
-#define BDC1_ENCODER_PPR               5281.1
-#define BDC2_ENCODER_PPR               1425.1
+#define BDC1_ENCODER_PPR               3895.9
+#define BDC2_ENCODER_PPR               3895.9
 #define BDC_ENCODER_PCNT_HIGH_LIMIT    5000
 #define BDC_ENCODER_PCNT_LOW_LIMIT    -5000
 
 #define BDC_PID_LOOP_PERIOD_MS        10   // calculate the motor speed every 10ms
-//#define Speed1_Command          5  // expected motor speed, in the pulses counted by the rotary encoder
 
 #define TXD_PIN 1
 #define RXD_PIN 3
@@ -244,7 +243,7 @@ void app_main(void)
     bdc_motor_config_t motor1_config = {
         .pwm_freq_hz = BDC_MCPWM_FREQ_HZ,
         .pwma_gpio_num = BDC1_MCPWM_GPIO_A,
-        .pwmb_gpio_num = BDC2_MCPWM_GPIO_B,
+        .pwmb_gpio_num = BDC1_MCPWM_GPIO_B,
     };
     bdc_motor_config_t motor2_config = {
         .pwm_freq_hz = BDC_MCPWM_FREQ_HZ,
