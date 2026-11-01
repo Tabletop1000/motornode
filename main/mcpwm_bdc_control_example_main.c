@@ -52,6 +52,9 @@ static const int RX_BUF_SIZE = 1024;
 
 #define TXD_PIN 1
 #define RXD_PIN 3
+
+#define CMD_TIMEOUT_US (500 * 1000)
+
 static const float pi = 3.1415926536;
 static float Speed1_Command = 0.0;
 static float Speed2_Command = 0.0;
@@ -195,11 +198,18 @@ static void rx_task(void *arg)
     static const char *RX_TASK_TAG = "RX_TASK";
     esp_log_level_set(RX_TASK_TAG, ESP_LOG_INFO);
     char* data = (char*) malloc(RX_BUF_SIZE + 1);
+    unsigned int last_cmd_us = 0;
     while(1) {
         const int rxBytes = uart_read_bytes(UART_NUM_0, data, RX_BUF_SIZE, 10 / portTICK_PERIOD_MS);
         if (rxBytes > 5) {
             data[rxBytes] = 0;
             sscanf(data,"%f:%f",&Speed1_Command, &Speed2_Command);
+            last_cmd_us = esp_timer_get_time();
+        }
+
+        if (esp_timer_get_time() - last_cmd_us > CMD_TIMEOUT_US) {
+            Speed1_Command = 0.0;
+            Speed2_Command = 0.0;
         }
     }
     free(data);
