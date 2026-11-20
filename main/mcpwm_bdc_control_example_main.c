@@ -5,26 +5,23 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/queue.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "driver/pulse_cnt.h"
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "bdc_motor.h"
-#include "pid_ctrl.h"
-#include "string.h"
-#include "math.h"
 
 static const char *TAG = "motornode";
 
-static const int RX_BUF_SIZE = 1024;
-
-// Enable this config,  we will print debug formated string, which in return can be captured and parsed by Serial-Studio
-#define SERIAL_STUDIO_DEBUG           1
+#define RX_BUF_SIZE                   1024
+#define RX_LINE_MAX                   64
 
 #define BDC_MCPWM_TIMER_RESOLUTION_HZ 10000000 // 10MHz, 1 tick = 0.1us
 #define BDC_MCPWM_FREQ_HZ             25000    // 25KHz PWM
@@ -32,7 +29,7 @@ static const int RX_BUF_SIZE = 1024;
 #define BDC1_MCPWM_GPIO_A              16
 #define BDC1_MCPWM_GPIO_B              17
 #define BDC2_MCPWM_GPIO_A              33
-#define BDC2_MCPWM_GPIO_B              32                                       
+#define BDC2_MCPWM_GPIO_B              32
 
 #define BDC1_EN_A                      26
 #define BDC1_EN_B                      27
@@ -43,46 +40,118 @@ static const int RX_BUF_SIZE = 1024;
 #define BDC1_ENCODER_GPIO_B            19
 #define BDC2_ENCODER_GPIO_A            4
 #define BDC2_ENCODER_GPIO_B            5
-#define BDC1_ENCODER_PPR               3895.9
-#define BDC2_ENCODER_PPR               3895.9
+#define BDC1_ENCODER_PPR               3895.9f
+#define BDC2_ENCODER_PPR               3895.9f
 #define BDC_ENCODER_PCNT_HIGH_LIMIT    5000
 #define BDC_ENCODER_PCNT_LOW_LIMIT    -5000
 
 #define BDC_PID_LOOP_PERIOD_MS        10   // calculate the motor speed every 10ms
+#define BDC_PID_LOOP_PERIOD_S         (BDC_PID_LOOP_PERIOD_MS / 1000.0f)
+
+// Duty (in ticks) added on top of the PID output to get past the motor's static friction.
+// Only applied when the PID is pushing in the same direction as the command, so the drive
+// never flips between +offset and -offset around zero (that flip caused a limit cycle).
+#define DEADBAND_OFFSET_TICKS         60
+
+// Commands with magnitude below this (rad/s) are treated as "stop": PID is reset and the
+// bridge is put in the idle state instead of servoing around zero.
+#define CMD_ZERO_EPS                  1e-3f
+
+// Don't drive the bridge against the direction of rotation while the wheel is still turning
+// faster than this (rad/s). Avoids plug-braking current spikes; brake passively instead.
+#define REVERSE_LOCKOUT_SPEED         1.0f
+
+// How long the driver enable pins are held low on an "EN" reset command.
+#define DRIVER_RESET_LOW_MS           20
 
 #define TXD_PIN 1
 #define RXD_PIN 3
 
 #define CMD_TIMEOUT_US (500 * 1000)
 
-static const float pi = 3.1415926536;
-static float Speed1_Command = 0.0;
-static float Speed2_Command = 0.0;
+static const float pi = 3.1415926536f;
+
+// Wheel speed commands in rad/s, written by the UART task and read by the PID timer callbacks.
+static volatile float speed_cmd[2] = {0.0f, 0.0f};
+static portMUX_TYPE speed_cmd_lock = portMUX_INITIALIZER_UNLOCKED;
+
+// Incremental (velocity form) PID, same formula as espressif/pid_ctrl but with a reset.
+typedef struct {
+    float kp;
+    float ki;
+    float kd;
+    float out_max;   // output is clamped to [-out_max, out_max]
+    float err1;      // e(k-1)
+    float err2;      // e(k-2)
+    float out;       // u(k-1)
+} speed_pid_t;
 
 typedef struct {
     bdc_motor_handle_t motor;
     pcnt_unit_handle_t pcnt_encoder;
-    pid_ctrl_block_handle_t pid_ctrl;
+    speed_pid_t pid;
     float encoder_ppr;
-    int report_pulses_diff;
-    int report_pulses;
+    float output_scale;     // duty ticks per unit of PID output
+    int cmd_index;          // index into speed_cmd[]
+    int last_pulse_count;
+    volatile int report_pulses_diff;
 } motor_control_context_t;
 
+static void speed_pid_reset(speed_pid_t *pid)
+{
+    pid->err1 = 0.0f;
+    pid->err2 = 0.0f;
+    pid->out = 0.0f;
+}
+
+static float speed_pid_step(speed_pid_t *pid, float error)
+{
+    float out = pid->out +
+                (error - pid->err1) * pid->kp +
+                (error - 2.0f * pid->err1 + pid->err2) * pid->kd +
+                error * pid->ki;
+    // Clamping the accumulated output is the anti-windup for the incremental form.
+    if (out > pid->out_max) {
+        out = pid->out_max;
+    } else if (out < -pid->out_max) {
+        out = -pid->out_max;
+    }
+    pid->err2 = pid->err1;
+    pid->err1 = error;
+    pid->out = out;
+    return out;
+}
+
+static float get_speed_command(int index)
+{
+    taskENTER_CRITICAL(&speed_cmd_lock);
+    float cmd = speed_cmd[index];
+    taskEXIT_CRITICAL(&speed_cmd_lock);
+    return cmd;
+}
+
+static void set_speed_commands(float cmd1, float cmd2)
+{
+    taskENTER_CRITICAL(&speed_cmd_lock);
+    speed_cmd[0] = cmd1;
+    speed_cmd[1] = cmd2;
+    taskEXIT_CRITICAL(&speed_cmd_lock);
+}
 
 float ticks_to_angular_vel(int32_t ticks, float encoder_ppr, float dt)
 {
-    float angular_vel = 0.0;
-    if(encoder_ppr > 0) {
-        angular_vel = (ticks/dt)*((2*pi)/(encoder_ppr));
+    float angular_vel = 0.0f;
+    if (encoder_ppr > 0) {
+        angular_vel = (ticks / dt) * ((2 * pi) / (encoder_ppr));
     }
     return angular_vel;
 }
 
 float ticks_to_angle(int32_t ticks, float encoder_ppr)
 {
-    float angle = 0.0;
-    if(encoder_ppr > 0) {
-        angle = (ticks)*((2*pi)/(encoder_ppr));
+    float angle = 0.0f;
+    if (encoder_ppr > 0) {
+        angle = (ticks) * ((2 * pi) / (encoder_ppr));
     }
     return angle;
 }
@@ -94,125 +163,64 @@ float get_current_angle(motor_control_context_t *motor_ctx)
     return ticks_to_angle(cur_pulse_count, motor_ctx->encoder_ppr);
 }
 
+// Zero duty with both half-bridges held low. On a BTS7960/IBT-2 style driver that means both
+// low-side switches are on, i.e. the motor is shorted (resistive braking, no reverse drive).
+static void motor_idle(bdc_motor_handle_t motor)
+{
+    bdc_motor_set_speed(motor, 0);
+    bdc_motor_coast(motor);
+}
 
 static void pid_loop_cb(void *args)
 {
-    static int last_pulse_count = 0;
     motor_control_context_t *ctx = (motor_control_context_t *)args;
-    pcnt_unit_handle_t pcnt_unit = ctx->pcnt_encoder;
-    pid_ctrl_block_handle_t pid_ctrl = ctx->pid_ctrl;
-    bdc_motor_handle_t motor = ctx->motor;
-    float ppr = ctx->encoder_ppr;
 
     // get the result from rotary encoder
     int cur_pulse_count = 0;
-    pcnt_unit_get_count(pcnt_unit, &cur_pulse_count);
-    int real_pulses = cur_pulse_count - last_pulse_count;
-    last_pulse_count = cur_pulse_count;
+    pcnt_unit_get_count(ctx->pcnt_encoder, &cur_pulse_count);
+    int real_pulses = cur_pulse_count - ctx->last_pulse_count;
+    ctx->last_pulse_count = cur_pulse_count;
     ctx->report_pulses_diff = real_pulses;
-    float measured_speed = ticks_to_angular_vel(real_pulses, ppr, 0.01);
-    
+    float measured_speed = ticks_to_angular_vel(real_pulses, ctx->encoder_ppr, BDC_PID_LOOP_PERIOD_S);
 
-    // calculate the speed error
-    float error = Speed1_Command - measured_speed;
-    float new_speed = 0;
+    float cmd = get_speed_command(ctx->cmd_index);
 
-    // set the new speed
-    pid_compute(pid_ctrl, error, &new_speed);
-    int offset = 0;
-    if(new_speed < -0.01) {
-        offset = 60;
-        bdc_motor_forward(motor);
+    // Stop command: don't servo around zero (encoder quantisation + deadband offset made that
+    // oscillate). Reset the PID so the next command starts from a clean state.
+    if (fabsf(cmd) < CMD_ZERO_EPS) {
+        speed_pid_reset(&ctx->pid);
+        motor_idle(ctx->motor);
+        return;
     }
-    else if (new_speed > 0.01){
-        offset = 60;
-        bdc_motor_reverse(motor);
+
+    float out = speed_pid_step(&ctx->pid, cmd - measured_speed);
+
+    // Positive PID output produces positive measured speed (via bdc_motor_reverse, per wiring).
+    // Refuse to drive against the current rotation until the wheel has slowed down.
+    if ((out > 0 && measured_speed < -REVERSE_LOCKOUT_SPEED) ||
+        (out < 0 && measured_speed > REVERSE_LOCKOUT_SPEED)) {
+        ctx->pid.out = 0.0f;
+        motor_idle(ctx->motor);
+        return;
+    }
+
+    uint32_t duty = (uint32_t)(fabsf(out) * ctx->output_scale);
+    if (out * cmd > 0) {
+        duty += DEADBAND_OFFSET_TICKS;
+    }
+    if (duty >= BDC_MCPWM_DUTY_TICK_MAX) {
+        duty = BDC_MCPWM_DUTY_TICK_MAX - 1;
+    }
+
+    if (out > 0) {
+        bdc_motor_reverse(ctx->motor);
+    } else if (out < 0) {
+        bdc_motor_forward(ctx->motor);
     } else {
-        offset = 0;
+        motor_idle(ctx->motor);
+        return;
     }
-
-    uint32_t new_speed_uint = (uint32_t)(fabs(new_speed*5 + offset));
-    if (new_speed_uint >= BDC_MCPWM_DUTY_TICK_MAX)
-        new_speed_uint = BDC_MCPWM_DUTY_TICK_MAX-1;
-    bdc_motor_set_speed(motor, new_speed_uint);
-}
-
-static void pid2_loop_cb(void *args)
-{
-    static int last_pulse_count = 0;
-    motor_control_context_t *ctx = (motor_control_context_t *)args;
-    pcnt_unit_handle_t pcnt_unit = ctx->pcnt_encoder;
-    pid_ctrl_block_handle_t pid_ctrl = ctx->pid_ctrl;
-    bdc_motor_handle_t motor = ctx->motor;
-
-    // get the result from rotary encoder
-    int cur_pulse_count = 0;
-    pcnt_unit_get_count(pcnt_unit, &cur_pulse_count);
-    int real_pulses = cur_pulse_count - last_pulse_count;
-    last_pulse_count = cur_pulse_count;
-    ctx->report_pulses_diff = real_pulses;
-    float ppr = ctx->encoder_ppr;
-    float measured_speed = ticks_to_angular_vel(real_pulses, ppr, 0.01);
-
-    // calculate the speed error
-    float error = Speed2_Command - measured_speed;
-    float new_speed = 0;
-
-    // set the new speed
-    pid_compute(pid_ctrl, error, &new_speed);
-    int offset = 0;
-    if(new_speed < -0.01) {
-        offset = 60;
-        bdc_motor_forward(motor);
-    }
-    else if (new_speed > 0.01){
-        offset = 60;
-        bdc_motor_reverse(motor);
-    } else {
-        offset = 0;
-    }
-
-    uint32_t new_speed_uint = (uint32_t)(fabs(new_speed*2 + offset));
-    if (new_speed_uint >= BDC_MCPWM_DUTY_TICK_MAX)
-        new_speed_uint = BDC_MCPWM_DUTY_TICK_MAX-1;
-    bdc_motor_set_speed(motor, new_speed_uint);
-}
-
-void init_uart(void)
-{
-    const uart_config_t uart_config = {
-        .baud_rate = 115200,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT
-    };
-    uart_driver_install(UART_NUM_0, RX_BUF_SIZE * 2, 0, 0, NULL, 0);
-    uart_param_config(UART_NUM_0, &uart_config);
-    uart_set_pin(UART_NUM_0, TXD_PIN, RXD_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-}
-
-static void rx_task(void *arg)
-{
-    static const char *RX_TASK_TAG = "RX_TASK";
-    esp_log_level_set(RX_TASK_TAG, ESP_LOG_INFO);
-    char* data = (char*) malloc(RX_BUF_SIZE + 1);
-    unsigned int last_cmd_us = 0;
-    while(1) {
-        const int rxBytes = uart_read_bytes(UART_NUM_0, data, RX_BUF_SIZE, 10 / portTICK_PERIOD_MS);
-        if (rxBytes > 5) {
-            data[rxBytes] = 0;
-            sscanf(data,"%f:%f",&Speed1_Command, &Speed2_Command);
-            last_cmd_us = esp_timer_get_time();
-        }
-
-        if (esp_timer_get_time() - last_cmd_us > CMD_TIMEOUT_US) {
-            Speed1_Command = 0.0;
-            Speed2_Command = 0.0;
-        }
-    }
-    free(data);
+    bdc_motor_set_speed(ctx->motor, duty);
 }
 
 void enable_motor(void)
@@ -231,22 +239,119 @@ void disable_motor(void)
     gpio_set_level(BDC2_EN_B, 0U);
 }
 
+void init_uart(void)
+{
+    const uart_config_t uart_config = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT
+    };
+    uart_driver_install(UART_NUM_0, RX_BUF_SIZE * 2, 0, 0, NULL, 0);
+    uart_param_config(UART_NUM_0, &uart_config);
+    uart_set_pin(UART_NUM_0, TXD_PIN, RXD_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+}
+
+// Handle one complete message. Returns true if it was a valid speed command.
+static bool process_line(const char *line)
+{
+    // "EN": pulse the driver enable pins low to clear a latched driver fault.
+    if (strcmp(line, "EN") == 0) {
+        disable_motor();
+        vTaskDelay(pdMS_TO_TICKS(DRIVER_RESET_LOW_MS));
+        enable_motor();
+        return false;
+    }
+
+    float cmd1, cmd2;
+    if (sscanf(line, "%f:%f", &cmd1, &cmd2) == 2 && isfinite(cmd1) && isfinite(cmd2)) {
+        set_speed_commands(cmd1, cmd2);
+        return true;
+    }
+    return false;
+}
+
+static void rx_task(void *arg)
+{
+    uint8_t *data = (uint8_t *) malloc(RX_BUF_SIZE);
+    char line[RX_LINE_MAX];
+    size_t line_len = 0;
+    bool line_overflow = false;
+    int64_t last_cmd_us = 0;
+
+    while (1) {
+        const int rxBytes = uart_read_bytes(UART_NUM_0, data, RX_BUF_SIZE, pdMS_TO_TICKS(10));
+
+        for (int i = 0; i < rxBytes; i++) {
+            char c = (char)data[i];
+            if (c == '\n' || c == '\r') {
+                if (line_len > 0 && !line_overflow) {
+                    line[line_len] = '\0';
+                    if (process_line(line)) {
+                        last_cmd_us = esp_timer_get_time();
+                    }
+                }
+                line_len = 0;
+                line_overflow = false;
+            } else if (line_len < RX_LINE_MAX - 1) {
+                line[line_len++] = c;
+            } else {
+                line_overflow = true;   // discard the rest of an over-long line
+            }
+        }
+
+        // A 10ms gap with no data also ends a message, in case the sender doesn't send newlines.
+        if (rxBytes == 0 && line_len > 0) {
+            if (!line_overflow) {
+                line[line_len] = '\0';
+                if (process_line(line)) {
+                    last_cmd_us = esp_timer_get_time();
+                }
+            }
+            line_len = 0;
+            line_overflow = false;
+        }
+
+        if (esp_timer_get_time() - last_cmd_us > CMD_TIMEOUT_US) {
+            set_speed_commands(0.0f, 0.0f);
+        }
+    }
+    free(data);
+}
+
 void app_main(void)
 {
-    // Instal UART driver using an event queue here
     gpio_set_direction(BDC1_EN_A, GPIO_MODE_OUTPUT);
     gpio_set_direction(BDC1_EN_B, GPIO_MODE_OUTPUT);
     gpio_set_direction(BDC2_EN_A, GPIO_MODE_OUTPUT);
     gpio_set_direction(BDC2_EN_B, GPIO_MODE_OUTPUT);
 
+    // PID output limits are set so that out_max * scale + offset == max duty: anything beyond
+    // that can't change the duty and would only wind up.
     static motor_control_context_t motor1_ctrl_ctx = {
-        .pcnt_encoder = NULL,
         .encoder_ppr = BDC1_ENCODER_PPR,
+        .output_scale = 2.0f,
+        .cmd_index = 0,
+        .pid = {
+            .kp = 0.8f,
+            .ki = 0.4f,
+            .kd = 0.2f,
+            .out_max = (BDC_MCPWM_DUTY_TICK_MAX - 1 - DEADBAND_OFFSET_TICKS) / 2.0f,
+        },
     };
 
     static motor_control_context_t motor2_ctrl_ctx = {
-        .pcnt_encoder = NULL,
         .encoder_ppr = BDC2_ENCODER_PPR,
+        .output_scale = 2.0f,
+        .cmd_index = 1,
+        .pid = {
+            .kp = 0.8f,
+            .ki = 0.4f,
+            .kd = 0.2f,
+            .out_max = (BDC_MCPWM_DUTY_TICK_MAX - 1 - DEADBAND_OFFSET_TICKS) / 2.0f,
+        },
     };
 
     ESP_LOGI(TAG, "Create DC motors");
@@ -338,41 +443,6 @@ void app_main(void)
     ESP_ERROR_CHECK(pcnt_unit_start(pcnt2_unit));
     motor2_ctrl_ctx.pcnt_encoder = pcnt2_unit;
 
-    ESP_LOGI(TAG, "Create PID control blocks");
-    pid_ctrl_parameter_t pid1_runtime_param = {
-        .kp = 0.8,
-        .ki = 0.4,
-        .kd = 0.2,
-        .cal_type = PID_CAL_TYPE_INCREMENTAL,
-        .max_output   = BDC_MCPWM_DUTY_TICK_MAX - 1,
-        .min_output   = (-1) * (BDC_MCPWM_DUTY_TICK_MAX + 1),
-        .max_integral = 1000,
-        .min_integral = -1000,
-    };
-    pid_ctrl_block_handle_t pid_ctrl = NULL;
-    pid_ctrl_config_t pid_config = {
-        .init_param = pid1_runtime_param,
-    };
-    ESP_ERROR_CHECK(pid_new_control_block(&pid_config, &pid_ctrl));
-    motor1_ctrl_ctx.pid_ctrl = pid_ctrl;
-
-    pid_ctrl_parameter_t pid2_runtime_param = {
-        .kp = 0.5,
-        .ki = 0.4,
-        .kd = 0.2,
-        .cal_type = PID_CAL_TYPE_INCREMENTAL,
-        .max_output   = BDC_MCPWM_DUTY_TICK_MAX - 1,
-        .min_output   = (-1) * (BDC_MCPWM_DUTY_TICK_MAX + 1),
-        .max_integral = 1000,
-        .min_integral = -1000,
-    };
-    pid_ctrl_block_handle_t pid2_ctrl = NULL;
-    pid_ctrl_config_t pid2_config = {
-        .init_param = pid2_runtime_param,
-    };
-    ESP_ERROR_CHECK(pid_new_control_block(&pid2_config, &pid2_ctrl));
-    motor2_ctrl_ctx.pid_ctrl = pid2_ctrl;
-
     ESP_LOGI(TAG, "Create a timer to do PID calculation periodically");
     const esp_timer_create_args_t periodic_timer_args1 = {
         .callback = pid_loop_cb,
@@ -383,7 +453,7 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_timer_create(&periodic_timer_args1, &pid_loop_timer1));
 
     const esp_timer_create_args_t periodic_timer_args2 = {
-        .callback = pid2_loop_cb,
+        .callback = pid_loop_cb,
         .arg = &motor2_ctrl_ctx,
         .name = "pid_loop2"
     };
@@ -400,20 +470,15 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_timer_start_periodic(pid_loop_timer1, BDC_PID_LOOP_PERIOD_MS * 1000));
     ESP_ERROR_CHECK(esp_timer_start_periodic(pid_loop_timer2, BDC_PID_LOOP_PERIOD_MS * 1000));
     init_uart();
-    xTaskCreate(rx_task, "uart_rx_task", 2048*2, NULL, configMAX_PRIORITIES - 1, NULL);
+    xTaskCreate(rx_task, "uart_rx_task", 2048 * 2, NULL, configMAX_PRIORITIES - 1, NULL);
 
+    // Output format is parsed by the ROS hardware interface: "vel1:vel2:angle1:angle2"
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(50));
         printf("%f:%f:%f:%f\n",
-            ticks_to_angular_vel(motor1_ctrl_ctx.report_pulses_diff, BDC1_ENCODER_PPR, 0.01),
-            ticks_to_angular_vel(motor2_ctrl_ctx.report_pulses_diff, BDC2_ENCODER_PPR, 0.01),
-            get_current_angle(&motor1_ctrl_ctx),
-            get_current_angle(&motor2_ctrl_ctx));
-
-        // the following logging format is according to the requirement of serial-studio frame format
-        // also see the dashboard config file `serial-studio-dashboard.json` for more information
-#if SERIAL_STUDIO_DEBUG
-        //printf("/*%d*/\r\n", motor1_ctrl_ctx.report_pulses_diff);
-#endif
+               ticks_to_angular_vel(motor1_ctrl_ctx.report_pulses_diff, BDC1_ENCODER_PPR, BDC_PID_LOOP_PERIOD_S),
+               ticks_to_angular_vel(motor2_ctrl_ctx.report_pulses_diff, BDC2_ENCODER_PPR, BDC_PID_LOOP_PERIOD_S),
+               get_current_angle(&motor1_ctrl_ctx),
+               get_current_angle(&motor2_ctrl_ctx));
     }
 }
